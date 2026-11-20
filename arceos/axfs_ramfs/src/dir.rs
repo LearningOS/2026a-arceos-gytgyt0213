@@ -4,9 +4,7 @@ use alloc::{string::String, vec::Vec};
 
 use axfs_vfs::{VfsDirEntry, VfsNodeAttr, VfsNodeOps, VfsNodeRef, VfsNodeType};
 use axfs_vfs::{VfsError, VfsResult};
-use spin::RwLock;
-
-use crate::file::FileNode;
+use super::{file::FileNode, RwLock};
 
 /// The directory node in the RAM filesystem.
 ///
@@ -163,6 +161,44 @@ impl VfsNodeOps for DirNode {
         } else {
             self.remove_node(name)
         }
+    }
+
+    fn rename(&self, src_path: &str, dst_path: &str) -> VfsResult {
+        let src_path = axfs_vfs::path::canonicalize(src_path);
+        let dst_path = axfs_vfs::path::canonicalize(dst_path);
+        let (src_parent, src_name) = src_path.rsplit_once('/').unwrap_or((".", &src_path));
+        let (dst_parent, dst_name) = dst_path.rsplit_once('/').unwrap_or((".", &dst_path));
+        if [src_name, dst_name].iter().any(|name| matches!(*name, "" | "." | "..")) {
+            return Err(VfsError::InvalidInput);
+        }
+        let this = self.this.upgrade().ok_or(VfsError::NotFound)?;
+        let src_dir = this.clone().lookup(src_parent)?;
+        let dst_dir = this.lookup(dst_parent)?;
+        let src_dir = src_dir.as_any().downcast_ref::<DirNode>().ok_or(VfsError::NotADirectory)?;
+        let dst_dir = dst_dir.as_any().downcast_ref::<DirNode>().ok_or(VfsError::NotADirectory)?;
+        if !core::ptr::eq(src_dir, dst_dir) {
+            return Err(VfsError::Unsupported); // This exercise supports renaming within one directory.
+        }
+        let mut children = src_dir.children.write();
+        let source = children.get(src_name).ok_or(VfsError::NotFound)?;
+        if src_name == dst_name {
+            return Ok(());
+        }
+        if let Some(destination) = children.get(dst_name) {
+            let source_is_dir = source.get_attr()?.is_dir();
+            let destination_is_dir = destination.get_attr()?.is_dir();
+            if source_is_dir != destination_is_dir {
+                return Err(if source_is_dir { VfsError::NotADirectory } else { VfsError::IsADirectory });
+            }
+            if let Some(dir) = destination.as_any().downcast_ref::<DirNode>() {
+                if !dir.children.read().is_empty() {
+                    return Err(VfsError::DirectoryNotEmpty);
+                }
+            }
+        }
+        let source = children.remove(src_name).unwrap();
+        children.insert(dst_name.into(), source);
+        Ok(())
     }
 
     axfs_vfs::impl_vfs_dir_default! {}

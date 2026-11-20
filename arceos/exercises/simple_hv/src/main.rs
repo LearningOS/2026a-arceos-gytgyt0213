@@ -50,10 +50,10 @@ fn main() {
     prepare_vm_pgtable(ept_root);
 
     // Kick off vm and wait for it to exit.
-    while !run_guest(&mut ctx) {
+    while !run_guest(&mut ctx, &uspace) {
     }
 
-    panic!("Hypervisor ok!");
+    ax_println!("Hypervisor ok!");
 }
 
 fn prepare_vm_pgtable(ept_root: PhysAddr) {
@@ -67,16 +67,16 @@ fn prepare_vm_pgtable(ept_root: PhysAddr) {
     }
 }
 
-fn run_guest(ctx: &mut VmCpuRegisters) -> bool {
+fn run_guest(ctx: &mut VmCpuRegisters, aspace: &axmm::AddrSpace) -> bool {
     unsafe {
         _run_guest(ctx);
     }
 
-    vmexit_handler(ctx)
+    vmexit_handler(ctx, aspace)
 }
 
 #[allow(unreachable_code)]
-fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
+fn vmexit_handler(ctx: &mut VmCpuRegisters, aspace: &axmm::AddrSpace) -> bool {
     use scause::{Exception, Trap};
 
     let scause = scause::read();
@@ -102,16 +102,22 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
             }
         },
         Trap::Exception(Exception::IllegalInstruction) => {
-            panic!("Bad instruction: {:#x} sepc: {:#x}",
-                stval::read(),
-                ctx.guest_regs.sepc
-            );
+            let instruction = guest_instruction(ctx, aspace);
+            // Emulate a read of the machine hart ID for this virtual CPU.
+            // CSRRS rd, mhartid, zero cannot execute directly in VS mode.
+            assert_eq!(instruction & 0xffff_f07f, 0xf140_2073, "unsupported guest CSR access");
+            let rd = crate::regs::GprIndex::from_raw((instruction >> 7) & 0x1f).unwrap();
+            ctx.guest_regs.gprs.set_reg(rd, 0x1234);
+            ctx.guest_regs.sepc += 4;
         },
         Trap::Exception(Exception::LoadGuestPageFault) => {
-            panic!("LoadGuestPageFault: stval{:#x} sepc: {:#x}",
-                stval::read(),
-                ctx.guest_regs.sepc
-            );
+            let instruction = guest_instruction(ctx, aspace);
+            // The sample guest reads an emulated 64-bit device register at 0x40.
+            assert_eq!(stval::read(), 0x40, "unsupported guest device address");
+            assert_eq!(instruction & 0x707f, 0x3003, "expected a 64-bit load");
+            let rd = crate::regs::GprIndex::from_raw((instruction >> 7) & 0x1f).unwrap();
+            ctx.guest_regs.gprs.set_reg(rd, 0x6688);
+            ctx.guest_regs.sepc += 4;
         },
         _ => {
             panic!(
@@ -123,6 +129,12 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
         }
     }
     false
+}
+
+fn guest_instruction(ctx: &VmCpuRegisters, aspace: &axmm::AddrSpace) -> u32 {
+    let mut bytes = [0; 4];
+    aspace.read(ctx.guest_regs.sepc.into(), &mut bytes).expect("invalid guest instruction address");
+    u32::from_le_bytes(bytes)
 }
 
 fn prepare_guest_context(ctx: &mut VmCpuRegisters) {

@@ -131,16 +131,61 @@ fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
     ret
 }
 
-#[allow(unused_variables)]
 fn sys_mmap(
     addr: *mut usize,
     length: usize,
     prot: i32,
     flags: i32,
     fd: i32,
-    _offset: isize,
+    offset: isize,
 ) -> isize {
-    unimplemented!("no sys_mmap!");
+    use axhal::mem::{MemoryAddr, VirtAddr, PAGE_SIZE_4K};
+    use memory_addr::VirtAddrRange;
+
+    syscall_body!(sys_mmap, {
+        let prot = MmapProt::from_bits(prot).ok_or(LinuxError::EINVAL)?;
+        let flags = MmapFlags::from_bits(flags).ok_or(LinuxError::EINVAL)?;
+        if length == 0 || offset < 0 || offset as usize % PAGE_SIZE_4K != 0 {
+            return Err(LinuxError::EINVAL);
+        }
+        // This exercise implements eager, private mappings. Shared writeback and
+        // replacing an existing mapping require additional VM bookkeeping.
+        if !flags.contains(MmapFlags::MAP_PRIVATE)
+            || flags.intersects(MmapFlags::MAP_SHARED | MmapFlags::MAP_FIXED)
+        {
+            return Err(LinuxError::ENOSYS);
+        }
+        let size = length.checked_add(PAGE_SIZE_4K - 1)
+            .ok_or(LinuxError::ENOMEM)? & !(PAGE_SIZE_4K - 1);
+        let mut data = alloc::vec::Vec::new();
+        if !flags.contains(MmapFlags::MAP_ANONYMOUS) {
+            (offset as usize).checked_add(length).ok_or(LinuxError::EOVERFLOW)?;
+            data.try_reserve_exact(length).map_err(|_| LinuxError::ENOMEM)?;
+            data.resize(length, 0);
+            let mut read = 0;
+            while read < length {
+                let n = api::read_file_at(fd, offset as u64 + read as u64, &mut data[read..])?;
+                if n == 0 {
+                    break;
+                }
+                read += n;
+            }
+        }
+        let curr = current();
+        let mut aspace = curr.task_ext().aspace.lock();
+        // Keep page zero unmapped even when userspace supplies a null hint.
+        let hint = VirtAddr::from_usize((addr as usize).max(PAGE_SIZE_4K)).align_up_4k();
+        let limit = VirtAddrRange::new(aspace.base().max(PAGE_SIZE_4K.into()), aspace.end());
+        let start = aspace.find_free_area(hint, size, limit)
+            .or_else(|| aspace.find_free_area(limit.start, size, limit))
+            .ok_or(LinuxError::ENOMEM)?;
+        aspace.map_alloc(start, size, prot.into(), true)?;
+        if !data.is_empty() {
+            aspace.write(start, &data)?;
+        }
+        axhal::arch::flush_tlb(None);
+        Ok(start.as_usize())
+    })
 }
 
 fn sys_openat(dfd: c_int, fname: *const c_char, flags: c_int, mode: api::ctypes::mode_t) -> isize {

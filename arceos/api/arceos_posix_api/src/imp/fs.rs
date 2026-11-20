@@ -75,6 +75,11 @@ impl FileLike for File {
     }
 }
 
+/// Reads a file at an explicit offset without changing its shared file position.
+pub fn read_file_at(fd: c_int, offset: u64, buf: &mut [u8]) -> LinuxResult<usize> {
+    Ok(File::from_fd(fd)?.inner.lock().read_at(offset, buf)?)
+}
+
 /// Convert open flags to [`OpenOptions`].
 fn flags_to_options(flags: c_int, _mode: ctypes::mode_t) -> OpenOptions {
     let flags = flags as u32;

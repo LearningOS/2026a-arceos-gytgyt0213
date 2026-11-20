@@ -192,9 +192,15 @@ impl VfsNodeOps for DirWrapper<'static> {
             src_path, dst_path
         );
 
-        self.0
-            .rename(src_path, &self.0, dst_path)
-            .map_err(as_vfs_err)
+        match self.0.rename(src_path, &self.0, dst_path) {
+            Err(fatfs::Error::AlreadyExists) => {
+                // Replacement used to happen in the VFS layer. Keep FAT's
+                // overwrite behavior here, after the source has been validated.
+                self.0.remove(dst_path).map_err(as_vfs_err)?;
+                self.0.rename(src_path, &self.0, dst_path).map_err(as_vfs_err)
+            }
+            result => result.map_err(as_vfs_err),
+        }
     }
 }
 

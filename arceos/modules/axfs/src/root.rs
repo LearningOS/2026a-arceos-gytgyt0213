@@ -137,7 +137,15 @@ impl VfsNodeOps for RootDirectory {
             if rest_path.is_empty() {
                 ax_err!(PermissionDenied) // cannot rename mount points
             } else {
-                fs.root_dir().rename(rest_path, dst_path)
+                self.lookup_mounted_fs(dst_path, |dst_fs, dst_rest| {
+                    if dst_rest.is_empty() {
+                        ax_err!(PermissionDenied)
+                    } else if !Arc::ptr_eq(&fs, &dst_fs) {
+                        ax_err!(Unsupported, "rename across filesystems")
+                    } else {
+                        fs.root_dir().rename(rest_path, dst_rest)
+                    }
+                })
             }
         })
     }
@@ -302,9 +310,6 @@ pub(crate) fn set_current_dir(path: &str) -> AxResult {
 }
 
 pub(crate) fn rename(old: &str, new: &str) -> AxResult {
-    if parent_node_of(None, new).lookup(new).is_ok() {
-        warn!("dst file already exist, now remove it");
-        remove_file(None, new)?;
-    }
+    // Let the filesystem replace the destination atomically after validating the source.
     parent_node_of(None, old).rename(old, new)
 }
